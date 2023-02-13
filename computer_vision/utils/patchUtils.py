@@ -137,7 +137,7 @@ class ShiftedPatchTokenization(layers.Layer):
         return (tokens, patches)
 
 
-def visualizePatch(train_in: List[tf.Array]):
+def visualizePatch(train_in: List[tf.Tensor]):
     # Get a random image from the training dataset
     # and resize the image
     image = train_in[np.random.choice(range(train_in.shape[0]))]

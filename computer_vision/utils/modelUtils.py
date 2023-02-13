@@ -4,8 +4,9 @@ import tensorflow as tf
 from tensorflow.keras import layers
 
 from utils import config
+from utils import patchUtils
 
-class MultiHeadAtentionLSA(tf.keras.layers.MultiHeadAttention):
+class MultiHeadAttentionLSA(tf.keras.layers.MultiHeadAttention):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
 
@@ -25,26 +26,84 @@ class MultiHeadAtentionLSA(tf.keras.layers.MultiHeadAttention):
         attention_scores_dropout = self._dropout_layer(
             attention_scores, training=training
         )
+
         attention_output = tf.einsum(
             self._combine_equation, attention_scores_dropout, value
         )
+        
         return attention_output, attention_scores
 
 
-def mlp(x, hidden_units, dropout_rate):
+def mlp(x, hidden_units: int, dropout_rate: float):
+    """Creates a simple mlp block.
+
+    Args:
+        x (tf.Array): input to dense layer 
+        hidden_units (int): number of hidden units
+        dropout_rate (float): dropout rate
+
+    Returns:
+        _type_: _description_
+    """
+
     for units in hidden_units:
         x = layers.Dense(units, activation=tf.nn.gelu)(x)
         x = layers.Dropout(dropout_rate)(x)
     return x
 
-def create_vit_classifier(diag_attn_mask, vanilla=False):
-    inputs = layers.Input(shape=config.INPUT_SHAPE)
+
+def data_augmentation(x_train: tf.Tensor):
+    """Create data augmentation pipeline trough a sequential model.
+
+    Args:
+    
+        x (List[tf.Array]): train images for alignment
+
+    Returns:
+        tf.keras.layers: augmentation layer
+    """
+
+    # augment data
+    data_augmentation = tf.keras.Sequential(
+        [
+            layers.Normalization(),
+            layers.Resizing(
+                config.IMAGE_SIZE,
+                config.IMAGE_SIZE),
+            layers.RandomFlip("horizontal"),
+            layers.RandomRotation(factor=0.02),
+            layers.RandomZoom(height_factor=0.2, width_factor=0.2),
+        ],
+        name="data_augmentation",
+    )
+
+    # Compute the mean and the variance of the training data for normalization.
+    data_augmentation.layers[0].adapt(x_train)
+    return data_augmentation
+
+def create_vit_classifier(x_train, vanilla=False):
+    """Combines the patching, the encoding and the transformer 
+    layers and returns the keras model. Requires the train data to 
+    adapt the data augmentation layer.
+    
+    Args:
+        x_train (tf.Array): training images for augmentation layer 
+        vanilla (bool, optional): Defines if the images are vanilla or shifted. Defaults to False.
+
+    Returns:
+        tf.keras.Model: keras model 
+    """
+    # Build the diagonal attention mask for later
+    diag_attn_mask = 1 - tf.eye(config.NUM_PATCHES)
+    diag_attn_mask = tf.cast([diag_attn_mask], dtype=tf.int8)
+
     # Augment data.
-    augmented = data_augmentation(inputs)
-    # Create patches.
-    (tokens, _) = ShiftedPatchTokenization(vanilla=vanilla)(augmented)
-    # Encode patches.
-    encoded_patches = PatchEncoder()(tokens)
+    inputs = layers.Input(shape=config.INPUT_SHAPE)
+    augmented = data_augmentation(x_train)(inputs)
+    
+    # create and encode patches.
+    (tokens, _) = patchUtils.ShiftedPatchTokenization(vanilla=vanilla)(augmented)
+    encoded_patches = patchUtils.PatchEncoder()(tokens)
 
     # Create multiple layers of the Transformer block.
     for _ in range(config.TRANSFORMER_LAYERS):
@@ -58,8 +117,8 @@ def create_vit_classifier(diag_attn_mask, vanilla=False):
             )(x1, x1, attention_mask=diag_attn_mask)
         else:
             attention_output = layers.MultiHeadAttention(
-                num_heads=config.NUM_HEADS, 
-                key_dim=config.PROJECTION_DIM, 
+                num_heads=config.NUM_HEADS,
+                key_dim=config.PROJECTION_DIM,
                 dropout=0.1
             )(x1, x1)
 
@@ -71,15 +130,13 @@ def create_vit_classifier(diag_attn_mask, vanilla=False):
         # Skip connection 2.
         encoded_patches = layers.Add()([x3, x2])
 
-    # Create a [batch_size, projection_dim] tensor.
+    # create a [batch_size, projection_dim] tensor.
     representation = layers.LayerNormalization(epsilon=1e-6)(encoded_patches)
     representation = layers.Flatten()(representation)
     representation = layers.Dropout(0.5)(representation)
-    # Add MLP.
+    
+    # add MLP and classification layer.
     features = mlp(representation, hidden_units=config.MLP_HEAD_UNITS, dropout_rate=0.5)
-    # Classify outputs.
     logits = layers.Dense(config.NUM_CLASSES)(features)
     
-    
-    model = keras.Model(inputs=inputs, outputs=logits)
-    return model
+    return tf.keras.Model(inputs=inputs, outputs=logits)
